@@ -116,6 +116,19 @@ func renderReport(w io.Writer, o options, col Column, start, end time.Time,
 		fmt.Fprintf(w, "- **In flight:** %.3f spans on average (self-time ÷ wall-time)\n",
 			grandSelf/1e9/windowSecs)
 	}
+	// When a selection (usually a --match onto a parent operation) spends almost
+	// all its time inside child spans that the filter excluded, self-time — and
+	// therefore INFLIGHT — collapses toward zero and the headline reads as idle
+	// for something the reader picked precisely because it is slow. Say so, and
+	// point at where the real number is.
+	if len(groups) > 0 && grandCum > 0 && grandSelf < 0.2*grandCum {
+		where := "raise --top to see per-operation latency"
+		if o.top != 0 {
+			where = "read the AVG/P95/P99 latency columns below"
+		}
+		fmt.Fprintf(w, "- **Mostly in children:** self-time is only %.0f%% of the %s cumulative span time in this selection, so INFLIGHT understates it — %s.\n",
+			pct(grandSelf, grandCum), humanDuration(grandCum), where)
+	}
 	if o.match != "" {
 		fmt.Fprintf(w, "- **Filter:** `%s`\n", mdEscape(o.match))
 	}

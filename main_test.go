@@ -223,6 +223,29 @@ func TestRenderReportEscapesPipesInNames(t *testing.T) {
 	}
 }
 
+// A parent-heavy selection (self-time ≈ 0, large cumulative) must warn that
+// INFLIGHT understates it, instead of silently reading as idle.
+func TestRenderReportMostlyInChildren(t *testing.T) {
+	start := time.Date(2026, 8, 26, 0, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	col, _ := resolveColumn("service")
+	// self is 1% of cumulative — the Directory.export pattern.
+	groups := []GroupRow{{Name: "svc", Calls: 100, CumNs: 100e9, SelfNs: 1e9}}
+	var b strings.Builder
+	renderReport(&b, options{table: "otel_traces", top: 15}, col, start, end,
+		Totals{Spans: 100}, groups, nil, nil, nil)
+	if !strings.Contains(b.String(), "Mostly in children") {
+		t.Errorf("parent-heavy selection must warn:\n%s", b.String())
+	}
+	// A normal selection (self a healthy fraction of cumulative) must NOT warn.
+	var b2 strings.Builder
+	renderReport(&b2, options{table: "otel_traces", top: 15}, col, start, end,
+		Totals{Spans: 100}, []GroupRow{{Name: "svc", Calls: 100, CumNs: 100e9, SelfNs: 70e9}}, nil, nil, nil)
+	if strings.Contains(b2.String(), "Mostly in children") {
+		t.Errorf("a healthy self/cum ratio must not warn:\n%s", b2.String())
+	}
+}
+
 // --top=0 asks for a summary. The top-N sections must be omitted, NOT rendered
 // empty with a "did not complete" note that reads as a failure.
 func TestRenderReportTopZeroOmitsTables(t *testing.T) {
