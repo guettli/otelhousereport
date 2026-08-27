@@ -58,6 +58,33 @@ func Open(ctx context.Context, dsn, table string, timeout time.Duration) (*Store
 
 func (s *Store) Close() error { return s.conn.Close() }
 
+// maxExecRe pulls the cap out of ClickHouse's max_execution_time rejection so
+// the tool can name the exact number to pass.
+var maxExecRe = regexp.MustCompile(`max_execution_time shouldn't be greater than (\d+)`)
+
+// translateCHError rewrites the one ClickHouse error a user is most likely to
+// hit and least likely to understand. clickhouse-go turns the per-query timeout
+// into the server-side max_execution_time setting; a read-only profile commonly
+// caps that at 30s, and the raw rejection ("code: 452 … shouldn't be greater
+// than 30") names neither --timeout nor what to do. This says both.
+func translateCHError(err error, timeout time.Duration) error {
+	if err == nil {
+		return nil
+	}
+	if m := maxExecRe.FindStringSubmatch(err.Error()); m != nil {
+		return fmt.Errorf("the ClickHouse server caps max_execution_time at %ss, "+
+			"but --timeout is %s and the driver sends it as that setting; "+
+			"lower --timeout to <= %ss: %w", m[1], timeout, m[1], err)
+	}
+	return err
+}
+
+// qerr wraps a query error with what was being done and the translation above,
+// so every call site gets the friendly max_execution_time message for free.
+func (s *Store) qerr(what string, err error) error {
+	return fmt.Errorf("%s: %w", what, translateCHError(err, s.timeout))
+}
+
 // call bounds one query with the store's per-query timeout.
 func (s *Store) call(ctx context.Context) (context.Context, context.CancelFunc) {
 	if s.timeout <= 0 {
@@ -183,7 +210,7 @@ FROM %s s WHERE %s`, s.table, where)
 	var t Totals
 	row := s.conn.QueryRow(cctx, q, args...)
 	if err := row.Scan(&t.Spans, &t.Traces, &t.Services, &t.Errors, &t.Min, &t.Max); err != nil {
-		return Totals{}, fmt.Errorf("totals: %w", err)
+		return Totals{}, fmt.Errorf("totals: %w", translateCHError(err, s.timeout))
 	}
 	return t, nil
 }
@@ -201,7 +228,7 @@ GROUP BY g ORDER BY self_ns DESC %s`,
 	defer cancel()
 	rows, err := s.conn.Query(cctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("group by %s: %w", col.Flag, err)
+		return nil, fmt.Errorf("group by %s: %w", col.Flag, translateCHError(err, s.timeout))
 	}
 	defer rows.Close()
 	var out []GroupRow
@@ -231,7 +258,7 @@ GROUP BY svc, op ORDER BY self_ns DESC LIMIT %d %s`,
 	defer cancel()
 	rows, err := s.conn.Query(cctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("hot operations: %w", err)
+		return nil, fmt.Errorf("hot operations: %w", translateCHError(err, s.timeout))
 	}
 	defer rows.Close()
 	var out []OpRow
@@ -257,7 +284,7 @@ GROUP BY svc, op HAVING errors > 0 ORDER BY errors DESC LIMIT %d`,
 	defer cancel()
 	rows, err := s.conn.Query(cctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("error operations: %w", err)
+		return nil, fmt.Errorf("error operations: %w", translateCHError(err, s.timeout))
 	}
 	defer rows.Close()
 	var out []ErrRow

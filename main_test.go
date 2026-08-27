@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -123,6 +124,24 @@ func TestPctGuardsZero(t *testing.T) {
 	}
 	if got := pct(1, 4); got != 25 {
 		t.Errorf("pct(1,4) = %v, want 25", got)
+	}
+}
+
+func TestTranslateCHError(t *testing.T) {
+	raw := errors.New("code: 452, message: Setting max_execution_time shouldn't be greater than 30.")
+	got := translateCHError(raw, 60*time.Second)
+	for _, want := range []string{"caps max_execution_time at 30s", "--timeout", "lower --timeout to <= 30s"} {
+		if !strings.Contains(got.Error(), want) {
+			t.Errorf("translated error missing %q: %v", want, got)
+		}
+	}
+	// Unrelated errors pass through untouched.
+	other := errors.New("connection refused")
+	if translateCHError(other, time.Second).Error() != "connection refused" {
+		t.Error("non-452 errors must not be rewritten")
+	}
+	if translateCHError(nil, time.Second) != nil {
+		t.Error("nil must stay nil")
 	}
 }
 
