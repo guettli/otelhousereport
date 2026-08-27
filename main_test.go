@@ -17,6 +17,11 @@ func TestParseTime(t *testing.T) {
 		{"-6h", now.Add(-6 * time.Hour)},
 		{"6h", now.Add(-6 * time.Hour)}, // a bare duration reads as "ago"
 		{"-90m", now.Add(-90 * time.Minute)},
+		{"-7d", now.Add(-7 * 24 * time.Hour)},        // days: Go's parser cannot
+		{"7d", now.Add(-7 * 24 * time.Hour)},         // bare reads as "ago"
+		{"-1w", now.Add(-7 * 24 * time.Hour)},        // weeks
+		{"-1d12h", now.Add(-36 * time.Hour)},         // compound
+		{"-500ms", now.Add(-500 * time.Millisecond)}, // sub-second falls back
 		{"2026-08-26T06:00:00Z", time.Date(2026, 8, 26, 6, 0, 0, 0, time.UTC)},
 	}
 	for _, tc := range tests {
@@ -148,7 +153,7 @@ func TestRenderReport(t *testing.T) {
 	errOps := []ErrRow{{Service: "agentloop", Op: "POST /q", Calls: 200, Errors: 3}}
 
 	var b strings.Builder
-	renderReport(&b, options{table: "otel_traces"}, col, start, end, totals, groups, ops, errOps, nil)
+	renderReport(&b, options{table: "otel_traces", top: 15}, col, start, end, totals, groups, ops, errOps, nil)
 	out := b.String()
 
 	// grand self = 200e9 ns = 200 s over a 100 s window => 2.000 in flight.
@@ -178,7 +183,7 @@ func TestRenderReportMarksIncomplete(t *testing.T) {
 	end := start.Add(time.Hour)
 	col, _ := resolveColumn("service")
 	var b strings.Builder
-	renderReport(&b, options{table: "otel_traces"}, col, start, end,
+	renderReport(&b, options{table: "otel_traces", top: 15}, col, start, end,
 		Totals{Spans: 10}, nil, nil, nil, []string{"hot operations: context deadline exceeded"})
 	out := b.String()
 	if !strings.Contains(out, "INCOMPLETE") || !strings.Contains(out, "deadline exceeded") {
@@ -192,9 +197,30 @@ func TestRenderReportEscapesPipesInNames(t *testing.T) {
 	col, _ := resolveColumn("service")
 	ops := []OpRow{{Service: "svc", Op: "a|b", Calls: 1}}
 	var b strings.Builder
-	renderReport(&b, options{table: "otel_traces"}, col, start, end,
+	renderReport(&b, options{table: "otel_traces", top: 15}, col, start, end,
 		Totals{Spans: 1}, []GroupRow{{Name: "svc", Calls: 1, SelfNs: 1}}, ops, nil, nil)
 	if strings.Contains(b.String(), "| a|b |") {
 		t.Error("an unescaped pipe in an operation name breaks the table")
+	}
+}
+
+// --top=0 asks for a summary. The top-N sections must be omitted, NOT rendered
+// empty with a "did not complete" note that reads as a failure.
+func TestRenderReportTopZeroOmitsTables(t *testing.T) {
+	start := time.Date(2026, 8, 26, 0, 0, 0, 0, time.UTC)
+	end := start.Add(time.Hour)
+	col, _ := resolveColumn("service")
+	var b strings.Builder
+	renderReport(&b, options{table: "otel_traces", top: 0}, col, start, end,
+		Totals{Spans: 10, Errors: 2}, []GroupRow{{Name: "svc", Calls: 10, Errors: 2, SelfNs: 1e9}}, nil, nil, nil)
+	out := b.String()
+	if strings.Contains(out, "## Hottest operations") || strings.Contains(out, "## Errors") {
+		t.Errorf("--top=0 must omit the top-N sections:\n%s", out)
+	}
+	if strings.Contains(out, "did not complete") {
+		t.Errorf("--top=0 must not claim a query failed:\n%s", out)
+	}
+	if !strings.Contains(out, "## Where time goes") {
+		t.Errorf("--top=0 must still render the breakdown:\n%s", out)
 	}
 }

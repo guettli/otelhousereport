@@ -19,6 +19,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -35,11 +37,11 @@ func run(args []string) error {
 	fs := flag.NewFlagSet("otelhousereport", flag.ContinueOnError)
 	fs.StringVar(&o.dsn, "dsn", os.Getenv("CLICKHOUSE_DSN"), "ClickHouse DSN (default: $CLICKHOUSE_DSN)")
 	fs.StringVar(&o.table, "table", "otel_traces", "traces table name")
-	fs.StringVar(&o.from, "from", "-1h", "window start: RFC3339, or relative like -6h / -30m")
+	fs.StringVar(&o.from, "from", "-1h", "window start: RFC3339, or relative like -6h, -90m, -7d, -1w")
 	fs.StringVar(&o.to, "to", "now", "window end: RFC3339, or 'now'")
 	fs.StringVar(&o.by, "by", "service", "column for the breakdown: service, name, kind, status")
 	fs.StringVar(&o.match, "match", "", `filter to one value, e.g. service=agentloop`)
-	fs.IntVar(&o.top, "top", 15, "rows in the operation and error tables")
+	fs.IntVar(&o.top, "top", 15, "rows in the operation and error tables (0 = omit them; summary only)")
 	fs.StringVar(&o.out, "out", "", "write the report to this file (default: stdout)")
 	fs.DurationVar(&o.timeout, "timeout", 25*time.Second, "per-query timeout; also caps ClickHouse max_execution_time, so keep it under any server-side cap (a read-only profile often caps it at 30s)")
 	fs.Usage = func() {
@@ -211,14 +213,82 @@ func parseTime(s string, now time.Time) (time.Time, error) {
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
 		return t, nil
 	}
-	d, err := time.ParseDuration(s)
+	d, err := parseSignedDuration(s)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("%q is neither RFC3339 nor a duration like -6h", s)
+		return time.Time{}, fmt.Errorf("%q is neither RFC3339 nor a duration like -6h, -90m or -7d", s)
 	}
 	if d > 0 {
 		d = -d // "6h" reads as "6h ago", same as "-6h"
 	}
 	return now.Add(d), nil
+}
+
+var relUnitRe = regexp.MustCompile(`^([0-9]+(?:\.[0-9]+)?)([wdhms])`)
+
+// parseSignedDuration extends Go's time.ParseDuration with the units a human
+// reaching for a reporting window actually types: days and weeks. Go's parser
+// stops at hours, so "-7d" — which this tool's own README advertises — would
+// otherwise be rejected. Compound windows like "1d6h" work too.
+//
+// Sub-second units (ms, µs, ns) fall through to time.ParseDuration, so nothing
+// the standard parser accepted is lost.
+func parseSignedDuration(s string) (time.Duration, error) {
+	neg := false
+	switch {
+	case strings.HasPrefix(s, "-"):
+		neg, s = true, s[1:]
+	case strings.HasPrefix(s, "+"):
+		s = s[1:]
+	}
+	if d, ok := parseWDHMS(s); ok {
+		if neg {
+			d = -d
+		}
+		return d, nil
+	}
+	full := s
+	if neg {
+		full = "-" + s
+	}
+	return time.ParseDuration(full)
+}
+
+// parseWDHMS sums a sequence of week/day/hour/minute/second components. It
+// returns false — rather than a partial result — if the whole string is not
+// made of those components, so the caller can fall back to the standard parser
+// cleanly. "500ms" fails here (the trailing "s" has no number) and falls back,
+// which is the intended handoff.
+func parseWDHMS(s string) (time.Duration, bool) {
+	if s == "" {
+		return 0, false
+	}
+	var total time.Duration
+	for s != "" {
+		m := relUnitRe.FindStringSubmatch(s)
+		if m == nil {
+			return 0, false
+		}
+		val, err := strconv.ParseFloat(m[1], 64)
+		if err != nil {
+			return 0, false
+		}
+		var unit time.Duration
+		switch m[2] {
+		case "w":
+			unit = 7 * 24 * time.Hour
+		case "d":
+			unit = 24 * time.Hour
+		case "h":
+			unit = time.Hour
+		case "m":
+			unit = time.Minute
+		case "s":
+			unit = time.Second
+		}
+		total += time.Duration(val * float64(unit))
+		s = s[len(m[0]):]
+	}
+	return total, true
 }
 
 const usage = `otelhousereport - a Markdown report of where OpenTelemetry traces spend time

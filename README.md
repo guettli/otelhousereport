@@ -121,11 +121,11 @@ otelhousereport tables [flags]       list the otel_* tables present
 | Flag | Default | Meaning |
 |---|---|---|
 | `--dsn` | `$CLICKHOUSE_DSN` | ClickHouse DSN, e.g. `clickhouse://ro:***@ch:9000/otel` |
-| `--from` | `-1h` | window start: RFC3339, or relative (`-6h`, `-30m`) |
+| `--from` | `-1h` | window start: RFC3339, or relative (`-6h`, `-90m`, `-7d`, `-1w`; compound like `1d6h`) |
 | `--to` | `now` | window end |
 | `--by` | `service` | breakdown column: `service`, `name`, `kind`, `status` |
 | `--match` | | filter to one value, e.g. `service=agentloop` |
-| `--top` | `15` | rows in the operation and error tables |
+| `--top` | `15` | rows in the operation and error tables (`0` = summary only: header + breakdown) |
 | `--out` | | write to this file instead of stdout |
 | `--timeout` | `25s` | per-query timeout (see the note below) |
 

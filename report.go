@@ -70,14 +70,19 @@ func buildReport(ctx context.Context, s *Store, o options, start, end time.Time)
 	if err != nil {
 		note(err)
 	}
-	ops, err := s.HotOps(ctx, start, end, o.top, match)
-	if err != nil {
-		note(err)
-	}
+	// --top=0 asks for a summary: the header and the breakdown only. Skip the
+	// two top-N tables entirely rather than running LIMIT 0 queries and then
+	// rendering an empty table that reads as a failure.
+	var ops []OpRow
 	var errOps []ErrRow
-	if totals.Errors > 0 {
-		if errOps, err = s.ErrorOps(ctx, start, end, o.top, match); err != nil {
+	if o.top > 0 {
+		if ops, err = s.HotOps(ctx, start, end, o.top, match); err != nil {
 			note(err)
+		}
+		if totals.Errors > 0 {
+			if errOps, err = s.ErrorOps(ctx, start, end, o.top, match); err != nil {
+				note(err)
+			}
 		}
 	}
 
@@ -142,31 +147,34 @@ func renderReport(w io.Writer, o options, col Column, start, end time.Time,
 		fmt.Fprintf(w, "_No breakdown: this section's query did not complete._\n\n")
 	}
 
-	// Section 2: hottest operations.
-	fmt.Fprintf(w, "## Hottest operations (by self-time)\n\n")
-	if len(ops) > 0 {
-		headers := []string{"SERVICE", "OPERATION", "CALLS", "SELF", "AVG", "P95", "P99", "ERR%"}
-		var rows [][]string
-		for _, op := range ops {
-			rows = append(rows, []string{
-				mdEscape(orEmpty(op.Service)),
-				mdEscape(orEmpty(op.Op)),
-				humanCount(op.Calls),
-				humanDuration(op.SelfNs),
-				humanDuration(op.AvgNs),
-				humanDuration(op.P95Ns),
-				humanDuration(op.P99Ns),
-				fmt.Sprintf("%.1f", pct(float64(op.Errors), float64(op.Calls))),
-			})
+	// Section 2: hottest operations. Omitted entirely under --top=0, which asks
+	// for a summary (header + breakdown) rather than the top-N tables.
+	if o.top != 0 {
+		fmt.Fprintf(w, "## Hottest operations (by self-time)\n\n")
+		if len(ops) > 0 {
+			headers := []string{"SERVICE", "OPERATION", "CALLS", "SELF", "AVG", "P95", "P99", "ERR%"}
+			var rows [][]string
+			for _, op := range ops {
+				rows = append(rows, []string{
+					mdEscape(orEmpty(op.Service)),
+					mdEscape(orEmpty(op.Op)),
+					humanCount(op.Calls),
+					humanDuration(op.SelfNs),
+					humanDuration(op.AvgNs),
+					humanDuration(op.P95Ns),
+					humanDuration(op.P99Ns),
+					fmt.Sprintf("%.1f", pct(float64(op.Errors), float64(op.Calls))),
+				})
+			}
+			mdTable(w, headers, "llrrrrrr", rows)
+			fmt.Fprintln(w)
+		} else {
+			fmt.Fprintf(w, "_No operations: this section's query did not complete._\n\n")
 		}
-		mdTable(w, headers, "llrrrrrr", rows)
-		fmt.Fprintln(w)
-	} else {
-		fmt.Fprintf(w, "_No operations: this section's query did not complete._\n\n")
 	}
 
-	// Section 3: errors (only when there are any).
-	if t.Errors > 0 {
+	// Section 3: errors (only when there are any, and not under --top=0).
+	if o.top != 0 && t.Errors > 0 {
 		fmt.Fprintf(w, "## Errors\n\n")
 		if len(errOps) > 0 {
 			headers := []string{"SERVICE", "OPERATION", "CALLS", "ERRORS", "ERR%"}
