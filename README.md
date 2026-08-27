@@ -12,7 +12,7 @@ and errors go"* report over a time window, normalized so a 1-hour window and a
 
 The traces are the ones the OpenTelemetry Collector's
 [`clickhouseexporter`](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/exporter/clickhouseexporter)
-writes: the `otel_traces` table. This tool only ever **reads** it.
+writes: the `otel_traces` table (and, with `--logs`, `otel_logs`). This tool only ever **reads** them.
 
 ```console
 $ export CLICKHOUSE_DSN='clickhouse://ro:***@ch:9000/otel'
@@ -126,6 +126,7 @@ otelhousereport tables [flags]       list the otel_* tables present
 | `--by` | `service` | breakdown column: `service`, `name`, `kind`, `status`, or an attribute key `res:<key>` / `span:<key>` |
 | `--match` | | filter to a value; **repeatable** (values AND together), e.g. `service=agentloop`, `span:http.request.method=POST` |
 | `--top` | `15` | rows in the operation and error tables (`0` = summary only: header + breakdown) |
+| `--logs` | `false` | add an **Error logs** section: recurring `otel_logs` lines correlated to error spans (highest severity first) |
 | `--out` | | write to this file instead of stdout |
 | `--timeout` | `25s` | per-query timeout (see the note below) |
 
@@ -136,6 +137,7 @@ otelhousereport --match=service=agentloop --by=name  # drill into one service
 otelhousereport --by=span:http.request.method        # break HTTP spans down by verb
 otelhousereport --by=res:tenant --from=-24h          # by a resource attribute
 otelhousereport --match=service=agentloop --match=span:http.request.method=POST
+otelhousereport --from=-24h --logs                   # + why the errors happened
 otelhousereport --from=-7d --out=report.md           # write a file for an agent
 otelhousereport services --from=-24h                 # what services exist
 ```

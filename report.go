@@ -26,6 +26,7 @@ type options struct {
 	by      string
 	match   []string
 	top     int
+	logs    bool
 	out     string
 	timeout time.Duration
 }
@@ -82,15 +83,28 @@ func buildReport(ctx context.Context, s *Store, o options, start, end time.Time)
 		}
 	}
 
+	// Correlated error logs are opt-in (a second join) and only meaningful when
+	// there are errors and otel_logs actually exists.
+	var logs []LogRow
+	if o.logs && totals.Errors > 0 && s.HasTable(ctx, logsTable) {
+		limit := o.top
+		if limit <= 0 {
+			limit = 15
+		}
+		if logs, err = s.ErrorLogs(ctx, start, end, limit, matches); err != nil {
+			note(err)
+		}
+	}
+
 	var b strings.Builder
-	renderReport(&b, o, col, start, end, totals, groups, ops, errOps, failures)
+	renderReport(&b, o, col, start, end, totals, groups, ops, errOps, logs, failures)
 	return Report{Markdown: b.String(), Incomplete: len(failures) > 0}, nil
 }
 
 // renderReport writes the Markdown. It is a pure function of already-fetched
 // data so it can be unit-tested without a database.
 func renderReport(w io.Writer, o options, col Column, start, end time.Time,
-	t Totals, groups []GroupRow, ops []OpRow, errOps []ErrRow, failures []string) {
+	t Totals, groups []GroupRow, ops []OpRow, errOps []ErrRow, logs []LogRow, failures []string) {
 
 	windowSecs := end.Sub(start).Seconds()
 	var grandSelf, grandCum float64
@@ -202,6 +216,29 @@ func renderReport(w io.Writer, o options, col Column, start, end time.Time,
 		} else {
 			fmt.Fprintf(w, "_%s error span(s) in the window, but the error breakdown did not complete._\n\n",
 				humanCount(t.Errors))
+		}
+	}
+
+	// Section 4: correlated error logs (opt-in via --logs).
+	if o.logs && t.Errors > 0 {
+		fmt.Fprintf(w, "## Error logs\n\n")
+		if len(logs) > 0 {
+			fmt.Fprintf(w, "Recurring log lines on error spans, highest severity first (from `otel_logs`, joined on trace + span id).\n\n")
+			headers := []string{"SERVICE", "OPERATION", "SEV", "COUNT", "MESSAGE"}
+			var rows [][]string
+			for _, l := range logs {
+				rows = append(rows, []string{
+					mdEscape(orEmpty(l.Service)),
+					mdEscape(orEmpty(l.Op)),
+					mdEscape(l.Severity),
+					humanCount(l.Count),
+					mdEscape(l.Body),
+				})
+			}
+			mdTable(w, headers, "lllrl", rows)
+			fmt.Fprintln(w)
+		} else {
+			fmt.Fprintf(w, "_No log lines in `otel_logs` correlate to the error spans in this window (or the table is absent)._\n\n")
 		}
 	}
 

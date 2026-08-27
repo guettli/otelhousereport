@@ -53,6 +53,7 @@ func run(args []string) error {
 	fs.StringVar(&o.by, "by", "service", "breakdown column: service, name, kind, status, or res:<key> / span:<key>")
 	fs.Var((*stringSlice)(&o.match), "match", `filter to a value; repeatable, e.g. service=agentloop or span:http.request.method=POST`)
 	fs.IntVar(&o.top, "top", 15, "rows in the operation and error tables (0 = omit them; summary only)")
+	fs.BoolVar(&o.logs, "logs", false, "add an Error logs section: recurring log lines from otel_logs correlated to error spans")
 	fs.StringVar(&o.out, "out", "", "write the report to this file (default: stdout)")
 	fs.DurationVar(&o.timeout, "timeout", 25*time.Second, "per-query timeout; also caps ClickHouse max_execution_time, so keep it under any server-side cap (a read-only profile often caps it at 30s)")
 	fs.Usage = func() {

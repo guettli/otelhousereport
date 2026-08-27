@@ -342,6 +342,58 @@ GROUP BY svc, op HAVING errors > 0 ORDER BY errors DESC LIMIT %d`,
 	return out, rows.Err()
 }
 
+// logsTable is the stock clickhouseexporter logs table. Unlike the traces
+// table it is not configurable: --logs is a convenience correlation, and a
+// deployment that renamed its logs table can still get everything else.
+const logsTable = "otel_logs"
+
+// LogRow is one recurring log line correlated to an error span.
+type LogRow struct {
+	Service, Op, Severity, Body string
+	Count                       uint64
+}
+
+// ErrorLogs answers "why did it error" by joining otel_logs to the error spans
+// in the window (on TraceId+SpanId) and returning the recurring log lines,
+// highest severity first. It is opt-in (--logs) because it is a second join and
+// most reports do not need it.
+//
+// Ordering by severity, not count, is deliberate: a single ERROR line that
+// names the failure is worth more than hundreds of routine WARNs emitted inside
+// the same span, and count-first ordering would bury it.
+func (s *Store) ErrorLogs(ctx context.Context, start, end time.Time, top int, matches []Match) ([]LogRow, error) {
+	where, args := s.filter(start, end, matches)
+	q := fmt.Sprintf(`SELECT sp.ServiceName AS svc, sp.SpanName AS op,
+       l.SeverityText AS sev, substring(l.Body, 1, 200) AS body,
+       count() AS c, max(l.SeverityNumber) AS sevnum
+FROM %s l
+INNER JOIN (
+  SELECT s.TraceId AS TraceId, s.SpanId AS SpanId, s.ServiceName AS ServiceName, s.SpanName AS SpanName
+  FROM %s s WHERE %s AND s.StatusCode = 'Error'
+) sp ON l.TraceId = sp.TraceId AND l.SpanId = sp.SpanId
+WHERE l.Timestamp >= {start:DateTime64(9)} AND l.Timestamp < {end:DateTime64(9)}
+GROUP BY svc, op, sev, body
+ORDER BY sevnum DESC, c DESC LIMIT %d`,
+		logsTable, s.table, where, top)
+	cctx, cancel := s.call(ctx)
+	defer cancel()
+	rows, err := s.conn.Query(cctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("error logs: %w", translateCHError(err, s.timeout))
+	}
+	defer rows.Close()
+	var out []LogRow
+	for rows.Next() {
+		var r LogRow
+		var sevnum uint8
+		if err := rows.Scan(&r.Service, &r.Op, &r.Severity, &r.Body, &r.Count, &sevnum); err != nil {
+			return nil, fmt.Errorf("error logs: scan: %w", err)
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // NameCount is a (name, count) pair for the discovery subcommands.
 type NameCount struct {
 	A, B  string
@@ -409,6 +461,22 @@ func (s *Store) Tables(ctx context.Context) ([]string, error) {
 		out = append(out, n)
 	}
 	return out, rows.Err()
+}
+
+// HasTable reports whether a table exists in the current database. It is used
+// to skip the --logs correlation cleanly when otel_logs is absent, rather than
+// letting the join fail and clutter the report with an INCOMPLETE note.
+func (s *Store) HasTable(ctx context.Context, name string) bool {
+	tabs, err := s.Tables(ctx)
+	if err != nil {
+		return false
+	}
+	for _, t := range tabs {
+		if t == name {
+			return true
+		}
+	}
+	return false
 }
 
 // FullRange returns the first and last span timestamps across the whole table,
