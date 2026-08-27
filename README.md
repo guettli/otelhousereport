@@ -123,8 +123,8 @@ otelhousereport tables [flags]       list the otel_* tables present
 | `--dsn` | `$CLICKHOUSE_DSN` | ClickHouse DSN, e.g. `clickhouse://ro:***@ch:9000/otel` |
 | `--from` | `-1h` | window start: RFC3339, or relative (`-6h`, `-90m`, `-7d`, `-1w`; compound like `1d6h`) |
 | `--to` | `now` | window end |
-| `--by` | `service` | breakdown column: `service`, `name`, `kind`, `status` |
-| `--match` | | filter to one value, e.g. `service=agentloop` |
+| `--by` | `service` | breakdown column: `service`, `name`, `kind`, `status`, or an attribute key `res:<key>` / `span:<key>` |
+| `--match` | | filter to a value; **repeatable** (values AND together), e.g. `service=agentloop`, `span:http.request.method=POST` |
 | `--top` | `15` | rows in the operation and error tables (`0` = summary only: header + breakdown) |
 | `--out` | | write to this file instead of stdout |
 | `--timeout` | `25s` | per-query timeout (see the note below) |
@@ -133,9 +133,21 @@ otelhousereport tables [flags]       list the otel_* tables present
 otelhousereport --from=-24h                       # last day, by service
 otelhousereport --by=name --top=30                # hottest operations, wider
 otelhousereport --match=service=agentloop --by=name  # drill into one service
-otelhousereport --from=-7d --out=report.md        # write a file for an agent
-otelhousereport services --from=-24h              # what services exist
+otelhousereport --by=span:http.request.method        # break HTTP spans down by verb
+otelhousereport --by=res:tenant --from=-24h          # by a resource attribute
+otelhousereport --match=service=agentloop --match=span:http.request.method=POST
+otelhousereport --from=-7d --out=report.md           # write a file for an agent
+otelhousereport services --from=-24h                 # what services exist
 ```
+
+### Attributes
+
+`--by` and `--match` accept keys inside the OTel attribute maps as well as the
+four fixed columns: `res:<key>` / `resource:<key>` for `ResourceAttributes`
+(e.g. `res:tenant`, `res:k8s.namespace.name`) and `span:<key>` / `attr:<key>`
+for `SpanAttributes` (e.g. `span:http.request.method`, `span:http.response.status_code`).
+The key is bound as a query parameter, so arbitrary attribute names — dots,
+slashes — are safe. Spans lacking the key group under `(none)`.
 
 ### For agents
 
@@ -156,8 +168,9 @@ it goes digging in individual traces.
   traces table; a wide window over a busy table is real work for the server.
 - **Read-only by design.** The tool issues no DDL, no writes, and never
   interpolates a user-supplied *value* into SQL — times, `--match` values and
-  the like are always bound as native `{name:Type}` parameters. The only
-  identifiers that reach the SQL by name (the table and the group-by column) are
+  **attribute keys** are always bound as native `{name:Type}` parameters. The
+  only identifiers that reach the SQL by name — the table, the group/filter
+  column, and the `ResourceAttributes`/`SpanAttributes` map name — are
   whitelisted.
 
 ## License

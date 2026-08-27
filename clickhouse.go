@@ -93,35 +93,72 @@ func (s *Store) call(ctx context.Context) (context.Context, context.CancelFunc) 
 	return context.WithTimeout(ctx, s.timeout)
 }
 
-// Column is a whitelisted, injection-safe reference to a traces column that a
-// user may group or filter by. The map is the whitelist: a name not in it is
-// rejected before it can reach the SQL.
-type Column struct{ Flag, SQL string }
-
-var columns = map[string]Column{
-	"service": {"service", "ServiceName"},
-	"name":    {"name", "SpanName"},
-	"kind":    {"kind", "SpanKind"},
-	"status":  {"status", "StatusCode"},
+// Column is an injection-safe reference to something to group or filter by:
+// either a whitelisted traces column, or a key inside the ResourceAttributes /
+// SpanAttributes map. For a map key the key itself is bound as a query
+// parameter, so arbitrary attribute names — dots, slashes, whatever the app
+// emitted — are safe.
+type Column struct {
+	Flag   string // user token, for titles and messages: "service", "res:tenant"
+	Header string // table-header text
+	col    string // fixed column name (whitelisted), e.g. "ServiceName"; "" for a map key
+	mapCol string // "ResourceAttributes" | "SpanAttributes" for a map key; "" for a fixed column
+	key    string // the attribute key (bound, never concatenated)
 }
 
-// resolveColumn maps a user-facing flag value to a real column, accepting both
-// the short alias ("service") and the ClickHouse column name ("ServiceName").
-func resolveColumn(name string) (Column, error) {
-	key := strings.ToLower(name)
-	if c, ok := columns[key]; ok {
-		return c, nil
+// exprAndArgs renders the column as an s.-qualified SQL expression plus any
+// bound args it needs. paramName must be unique within a single query.
+func (c Column) exprAndArgs(paramName string) (string, []any) {
+	if c.mapCol != "" {
+		return fmt.Sprintf("s.%s[{%s:String}]", c.mapCol, paramName),
+			[]any{clickhouse.Named(paramName, c.key)}
 	}
-	for _, c := range columns {
+	return "s." + c.col, nil
+}
+
+var fixedColumns = map[string]struct{ Header, SQL string }{
+	"service": {"SERVICE", "ServiceName"},
+	"name":    {"NAME", "SpanName"},
+	"kind":    {"KIND", "SpanKind"},
+	"status":  {"STATUS", "StatusCode"},
+}
+
+// resolveColumn maps a user token to a Column. It accepts the short alias
+// ("service"), the ClickHouse column name ("ServiceName"), and an attribute
+// reference ("res:<key>" / "resource:<key>" for ResourceAttributes,
+// "span:<key>" / "attr:<key>" for SpanAttributes).
+func resolveColumn(name string) (Column, error) {
+	if mapCol, key, ok := attrRef(name); ok {
+		if key == "" {
+			return Column{}, fmt.Errorf("empty attribute key in %q (want e.g. res:tenant or span:http.request.method)", name)
+		}
+		return Column{Flag: name, Header: strings.ToUpper(key), mapCol: mapCol, key: key}, nil
+	}
+	key := strings.ToLower(name)
+	if c, ok := fixedColumns[key]; ok {
+		return Column{Flag: key, Header: c.Header, col: c.SQL}, nil
+	}
+	for k, c := range fixedColumns {
 		if strings.EqualFold(c.SQL, name) {
-			return c, nil
+			return Column{Flag: k, Header: c.Header, col: c.SQL}, nil
 		}
 	}
-	want := make([]string, 0, len(columns))
-	for _, c := range columns {
-		want = append(want, c.Flag)
+	return Column{}, fmt.Errorf("unknown column %q; use service, name, kind, status, or an attribute like res:<key> / span:<key>", name)
+}
+
+// attrRef splits an attribute reference into its map column and key.
+func attrRef(name string) (mapCol, key string, ok bool) {
+	for _, p := range []struct{ prefix, mapCol string }{
+		{"resource:", "ResourceAttributes"},
+		{"res:", "ResourceAttributes"},
+		{"span:", "SpanAttributes"},
+		{"attr:", "SpanAttributes"},
+	} {
+		if strings.HasPrefix(name, p.prefix) {
+			return p.mapCol, name[len(p.prefix):], true
+		}
 	}
-	return Column{}, fmt.Errorf("unknown column %q; group/filter by one of: %s", name, strings.Join(want, ", "))
+	return "", "", false
 }
 
 // Totals is the top-of-report summary of the window.
@@ -151,15 +188,20 @@ type ErrRow struct {
 	Calls, Errors uint64
 }
 
-// filter is the shared WHERE fragment (time window plus an optional --match),
-// with the bound arguments that go with it. Building the args alongside the SQL
-// keeps the two in lockstep and the values out of the SQL text.
-func (s *Store) filter(start, end time.Time, match *Match) (string, []any) {
+// filter is the shared WHERE fragment (time window plus zero or more --match
+// equalities), with the bound arguments that go with it. Building the args
+// alongside the SQL keeps the two in lockstep and every user value — including
+// attribute keys — out of the SQL text. Each match gets uniquely-named params
+// so multiple --match flags cannot collide.
+func (s *Store) filter(start, end time.Time, matches []Match) (string, []any) {
 	args := []any{clickhouse.Named("start", start), clickhouse.Named("end", end)}
 	where := "s.Timestamp >= {start:DateTime64(9)} AND s.Timestamp < {end:DateTime64(9)}"
-	if match != nil {
-		where += fmt.Sprintf(" AND s.%s = {mval:String}", match.Col.SQL)
-		args = append(args, clickhouse.Named("mval", match.Value))
+	for i, m := range matches {
+		expr, cargs := m.Col.exprAndArgs(fmt.Sprintf("mk%d", i))
+		vp := fmt.Sprintf("mv%d", i)
+		where += fmt.Sprintf(" AND %s = {%s:String}", expr, vp)
+		args = append(args, cargs...)
+		args = append(args, clickhouse.Named(vp, m.Value))
 	}
 	return where, args
 }
@@ -199,8 +241,8 @@ const selfExpr = `sum(greatest(toInt64(s.Duration) - toInt64(c.child_dur), 0))`
 const joinChildren = "LEFT JOIN children c ON s.TraceId = c.TraceId AND s.SpanId = c.SpanId"
 const settings = "SETTINGS join_use_nulls = 0"
 
-func (s *Store) GetTotals(ctx context.Context, start, end time.Time, match *Match) (Totals, error) {
-	where, args := s.filter(start, end, match)
+func (s *Store) GetTotals(ctx context.Context, start, end time.Time, matches []Match) (Totals, error) {
+	where, args := s.filter(start, end, matches)
 	q := fmt.Sprintf(`SELECT count() AS spans, uniqExact(s.TraceId) AS traces,
        uniqExact(s.ServiceName) AS services, countIf(s.StatusCode = 'Error') AS errors,
        min(s.Timestamp) AS mn, max(s.Timestamp) AS mx
@@ -215,15 +257,17 @@ FROM %s s WHERE %s`, s.table, where)
 	return t, nil
 }
 
-func (s *Store) GroupBy(ctx context.Context, col Column, start, end time.Time, match *Match) ([]GroupRow, error) {
-	where, args := s.filter(start, end, match)
+func (s *Store) GroupBy(ctx context.Context, col Column, start, end time.Time, matches []Match) ([]GroupRow, error) {
+	gexpr, gargs := col.exprAndArgs("bykey")
+	where, args := s.filter(start, end, matches)
+	args = append(args, gargs...)
 	q := fmt.Sprintf(`%s
-SELECT s.%s AS g, count() AS calls, countIf(s.StatusCode = 'Error') AS errors,
+SELECT %s AS g, count() AS calls, countIf(s.StatusCode = 'Error') AS errors,
        toFloat64(sum(s.Duration)) AS cum_ns, toFloat64(%s) AS self_ns
 FROM %s s %s
 WHERE %s
 GROUP BY g ORDER BY self_ns DESC %s`,
-		s.childrenCTE(), col.SQL, selfExpr, s.table, joinChildren, where, settings)
+		s.childrenCTE(), gexpr, selfExpr, s.table, joinChildren, where, settings)
 	cctx, cancel := s.call(ctx)
 	defer cancel()
 	rows, err := s.conn.Query(cctx, q, args...)
@@ -242,8 +286,8 @@ GROUP BY g ORDER BY self_ns DESC %s`,
 	return out, rows.Err()
 }
 
-func (s *Store) HotOps(ctx context.Context, start, end time.Time, top int, match *Match) ([]OpRow, error) {
-	where, args := s.filter(start, end, match)
+func (s *Store) HotOps(ctx context.Context, start, end time.Time, top int, matches []Match) ([]OpRow, error) {
+	where, args := s.filter(start, end, matches)
 	q := fmt.Sprintf(`%s
 SELECT s.ServiceName AS svc, s.SpanName AS op, count() AS calls,
        countIf(s.StatusCode = 'Error') AS errors,
@@ -273,8 +317,8 @@ GROUP BY svc, op ORDER BY self_ns DESC LIMIT %d %s`,
 	return out, rows.Err()
 }
 
-func (s *Store) ErrorOps(ctx context.Context, start, end time.Time, top int, match *Match) ([]ErrRow, error) {
-	where, args := s.filter(start, end, match)
+func (s *Store) ErrorOps(ctx context.Context, start, end time.Time, top int, matches []Match) ([]ErrRow, error) {
+	where, args := s.filter(start, end, matches)
 	q := fmt.Sprintf(`SELECT s.ServiceName AS svc, s.SpanName AS op,
        count() AS calls, countIf(s.StatusCode = 'Error') AS errors
 FROM %s s WHERE %s

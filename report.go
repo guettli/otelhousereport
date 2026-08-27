@@ -24,7 +24,7 @@ type options struct {
 	from    string
 	to      string
 	by      string
-	match   string
+	match   []string
 	top     int
 	out     string
 	timeout time.Duration
@@ -43,16 +43,12 @@ func buildReport(ctx context.Context, s *Store, o options, start, end time.Time)
 	if err := ensureTable(ctx, s, o.table); err != nil {
 		return Report{}, err
 	}
-	var match *Match
-	if o.match != "" {
-		m, err := parseMatch(o.match)
-		if err != nil {
-			return Report{}, err
-		}
-		match = m
+	matches, err := parseMatches(o.match)
+	if err != nil {
+		return Report{}, err
 	}
 
-	totals, err := s.GetTotals(ctx, start, end, match)
+	totals, err := s.GetTotals(ctx, start, end, matches)
 	if err != nil {
 		return Report{}, err
 	}
@@ -60,13 +56,13 @@ func buildReport(ctx context.Context, s *Store, o options, start, end time.Time)
 		// An empty answer gets the same scepticism as a failed one: say whether
 		// the table is missing, the table is empty, or the window simply misses
 		// the data — never assert the most convenient reading.
-		return Report{}, explainEmpty(ctx, s, o.table, start, end, match)
+		return Report{}, explainEmpty(ctx, s, o.table, start, end, matches)
 	}
 
 	var failures []string
 	note := func(err error) { failures = append(failures, err.Error()) }
 
-	groups, err := s.GroupBy(ctx, col, start, end, match)
+	groups, err := s.GroupBy(ctx, col, start, end, matches)
 	if err != nil {
 		note(err)
 	}
@@ -76,11 +72,11 @@ func buildReport(ctx context.Context, s *Store, o options, start, end time.Time)
 	var ops []OpRow
 	var errOps []ErrRow
 	if o.top > 0 {
-		if ops, err = s.HotOps(ctx, start, end, o.top, match); err != nil {
+		if ops, err = s.HotOps(ctx, start, end, o.top, matches); err != nil {
 			note(err)
 		}
 		if totals.Errors > 0 {
-			if errOps, err = s.ErrorOps(ctx, start, end, o.top, match); err != nil {
+			if errOps, err = s.ErrorOps(ctx, start, end, o.top, matches); err != nil {
 				note(err)
 			}
 		}
@@ -129,8 +125,8 @@ func renderReport(w io.Writer, o options, col Column, start, end time.Time,
 		fmt.Fprintf(w, "- **Mostly in children:** self-time is only %.0f%% of the %s cumulative span time in this selection, so INFLIGHT understates it — %s.\n",
 			pct(grandSelf, grandCum), humanDuration(grandCum), where)
 	}
-	if o.match != "" {
-		fmt.Fprintf(w, "- **Filter:** `%s`\n", mdEscape(o.match))
+	if len(o.match) > 0 {
+		fmt.Fprintf(w, "- **Filter:** `%s`\n", mdEscape(strings.Join(o.match, "` `")))
 	}
 	fmt.Fprintln(w)
 
@@ -138,7 +134,7 @@ func renderReport(w io.Writer, o options, col Column, start, end time.Time,
 	fmt.Fprintf(w, "## Where time goes — by %s\n\n", col.Flag)
 	if len(groups) > 0 {
 		fmt.Fprintf(w, "`INFLIGHT` is self-time ÷ wall-time — the average number of these spans running at once. `%%TIME` is the share of total self-time.\n\n")
-		headers := []string{strings.ToUpper(col.Flag), "INFLIGHT", "%TIME", "CALLS", "ERRORS"}
+		headers := []string{col.Header, "INFLIGHT", "%TIME", "CALLS", "ERRORS"}
 		var rows [][]string
 		for _, g := range groups {
 			rows = append(rows, []string{
@@ -233,18 +229,32 @@ func orEmpty(s string) string {
 }
 
 // parseMatch validates a --match of the form column=value. The column is
-// whitelisted (so it is injection-safe as an identifier) and the value is
-// returned to be passed as a bound parameter, never concatenated.
-func parseMatch(m string) (*Match, error) {
+// whitelisted or an attribute reference (so it is injection-safe) and the value
+// is returned to be passed as a bound parameter, never concatenated.
+func parseMatch(m string) (Match, error) {
 	k, v, ok := strings.Cut(m, "=")
 	if !ok {
-		return nil, fmt.Errorf("--match %q must be column=value, e.g. service=agentloop", m)
+		return Match{}, fmt.Errorf("--match %q must be column=value, e.g. service=agentloop or span:http.request.method=POST", m)
 	}
 	col, err := resolveColumn(strings.TrimSpace(k))
 	if err != nil {
-		return nil, fmt.Errorf("--match: %w", err)
+		return Match{}, fmt.Errorf("--match: %w", err)
 	}
-	return &Match{Col: col, Value: v}, nil
+	return Match{Col: col, Value: v}, nil
+}
+
+// parseMatches turns the repeated --match flags into validated Matches. They
+// are ANDed together, so `--match service=agentloop --match span:x=y` narrows.
+func parseMatches(ms []string) ([]Match, error) {
+	var out []Match
+	for _, m := range ms {
+		parsed, err := parseMatch(m)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, parsed)
+	}
+	return out, nil
 }
 
 // ensureTable fails early, with the list of tables that do exist, when the
@@ -273,7 +283,7 @@ func ensureTable(ctx context.Context, s *Store, table string) error {
 // explainEmpty turns an empty window into a specific conclusion — the table is
 // missing, the table is empty, or the window misses the data — rather than the
 // convenient "no data" that reads as an idle cluster.
-func explainEmpty(ctx context.Context, s *Store, table string, start, end time.Time, match *Match) error {
+func explainEmpty(ctx context.Context, s *Store, table string, start, end time.Time, matches []Match) error {
 	win := fmt.Sprintf("`%s` .. `%s`", start.UTC().Format(time.RFC3339), end.UTC().Format(time.RFC3339))
 
 	if tabs, err := s.Tables(ctx); err == nil {
@@ -293,12 +303,16 @@ func explainEmpty(ctx context.Context, s *Store, table string, start, end time.T
 		}
 	}
 
-	if match != nil {
+	if len(matches) > 0 {
 		// With a filter applied, "empty" most likely means the filter matched
 		// nothing, not that the window is empty. Say so instead of blaming the
 		// window.
-		return fmt.Errorf("no spans in %s matching --match %s=%q; drop --match or check the value with `otelhousereport %ss`",
-			win, match.Col.Flag, match.Value, match.Col.Flag)
+		parts := make([]string, len(matches))
+		for i, m := range matches {
+			parts[i] = m.Col.Flag + "=" + m.Value
+		}
+		return fmt.Errorf("no spans in %s matching --match %s; drop a --match or check values with `otelhousereport services` / `operations`",
+			win, strings.Join(parts, " "))
 	}
 
 	mn, mx, n, err := s.FullRange(ctx)

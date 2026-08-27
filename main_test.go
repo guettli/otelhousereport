@@ -52,12 +52,29 @@ func TestParseWindowRejectsInverted(t *testing.T) {
 func TestResolveColumn(t *testing.T) {
 	for _, in := range []string{"service", "Service", "ServiceName", "servicename"} {
 		c, err := resolveColumn(in)
-		if err != nil || c.SQL != "ServiceName" {
+		if err != nil || c.col != "ServiceName" {
 			t.Errorf("resolveColumn(%q) = (%+v, %v), want ServiceName", in, c, err)
 		}
 	}
 	if _, err := resolveColumn("Duration"); err == nil {
 		t.Error("a non-whitelisted column must be rejected (injection guard)")
+	}
+	// Attribute references resolve to a bound map lookup, never a raw column.
+	c, err := resolveColumn("res:tenant")
+	if err != nil || c.mapCol != "ResourceAttributes" || c.key != "tenant" {
+		t.Errorf(`resolveColumn("res:tenant") = (%+v, %v)`, c, err)
+	}
+	c, err = resolveColumn("span:http.request.method")
+	if err != nil || c.mapCol != "SpanAttributes" || c.key != "http.request.method" {
+		t.Errorf(`resolveColumn("span:...") = (%+v, %v)`, c, err)
+	}
+	if _, err := resolveColumn("res:"); err == nil {
+		t.Error("an empty attribute key must be rejected")
+	}
+	// The bound expression must place the key in a parameter, not concatenate it.
+	expr, args := c.exprAndArgs("mk0")
+	if !strings.Contains(expr, "{mk0:String}") || len(args) != 1 {
+		t.Errorf("attribute key must be bound, got expr=%q args=%v", expr, args)
 	}
 }
 
@@ -66,8 +83,13 @@ func TestParseMatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Col.SQL != "ServiceName" || m.Value != "agentloop" {
+	if m.Col.col != "ServiceName" || m.Value != "agentloop" {
 		t.Errorf("got %+v", m)
+	}
+	// Attribute filter: key resolves to a bound map lookup.
+	am, err := parseMatch("span:http.request.method=POST")
+	if err != nil || am.Col.mapCol != "SpanAttributes" || am.Col.key != "http.request.method" || am.Value != "POST" {
+		t.Errorf("attribute match = %+v, %v", am, err)
 	}
 	// A value containing '=' keeps everything after the first '=' verbatim; it
 	// is bound as a parameter, so an operation like "GET /a=b" is fine.

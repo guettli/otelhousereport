@@ -32,6 +32,17 @@ func main() {
 	}
 }
 
+// stringSlice is a flag.Value that accumulates a repeatable string flag, so
+// --match can be given more than once and the values AND together.
+type stringSlice []string
+
+func (s *stringSlice) String() string { return strings.Join(*s, ",") }
+
+func (s *stringSlice) Set(v string) error {
+	*s = append(*s, v)
+	return nil
+}
+
 func run(args []string) error {
 	var o options
 	fs := flag.NewFlagSet("otelhousereport", flag.ContinueOnError)
@@ -39,8 +50,8 @@ func run(args []string) error {
 	fs.StringVar(&o.table, "table", "otel_traces", "traces table name")
 	fs.StringVar(&o.from, "from", "-1h", "window start: RFC3339, or relative like -6h, -90m, -7d, -1w")
 	fs.StringVar(&o.to, "to", "now", "window end: RFC3339, or 'now'")
-	fs.StringVar(&o.by, "by", "service", "column for the breakdown: service, name, kind, status")
-	fs.StringVar(&o.match, "match", "", `filter to one value, e.g. service=agentloop`)
+	fs.StringVar(&o.by, "by", "service", "breakdown column: service, name, kind, status, or res:<key> / span:<key>")
+	fs.Var((*stringSlice)(&o.match), "match", `filter to a value; repeatable, e.g. service=agentloop or span:http.request.method=POST`)
 	fs.IntVar(&o.top, "top", 15, "rows in the operation and error tables (0 = omit them; summary only)")
 	fs.StringVar(&o.out, "out", "", "write the report to this file (default: stdout)")
 	fs.DurationVar(&o.timeout, "timeout", 25*time.Second, "per-query timeout; also caps ClickHouse max_execution_time, so keep it under any server-side cap (a read-only profile often caps it at 30s)")
