@@ -1,0 +1,29 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          # Track go.mod exactly: a floating '1.26' resolved to a patch older
+          # than the toolchain go.mod asks for, and GOTOOLCHAIN=local made that
+          # a hard build failure rather than an auto-download.
+          go-version-file: go.mod
+      - run: go build ./...
+      - run: go vet ./...
+      # The live ClickHouse e2e (report_live_test.go) is skipped without
+      # CLICKHOUSE_DSN, so CI runs the pure-logic tests only.
+      - run: go test -race ./...
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed: $unformatted"
+            exit 1
+          fi
