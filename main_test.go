@@ -167,6 +167,17 @@ func TestTranslateCHError(t *testing.T) {
 	}
 }
 
+func TestChildrenCTEExactToggle(t *testing.T) {
+	s := &Store{table: "otel_traces"}
+	if def := s.childrenCTE(); !strings.Contains(def, "sum(Duration)") || strings.Contains(def, "arrayFold") {
+		t.Errorf("default children CTE must be sum-based:\n%s", def)
+	}
+	s.exactSelf = true
+	if ex := s.childrenCTE(); !strings.Contains(ex, "arrayFold") {
+		t.Errorf("--exact-self-time children CTE must use arrayFold:\n%s", ex)
+	}
+}
+
 func TestMdEscape(t *testing.T) {
 	// A pipe would end the table cell; a newline would end the row. Both come
 	// from arbitrary application strings and must be neutralized.

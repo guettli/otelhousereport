@@ -48,6 +48,15 @@ func TestLive(t *testing.T) {
 	}
 	t.Logf("live report (%d bytes):\n%s", len(rep.Markdown), rep.Markdown)
 
+	// Exact self-time uses a different (arrayFold) children CTE; prove it runs.
+	exact, err := buildReport(ctx, s, options{table: "otel_traces", by: "service", top: 10, exactSelf: true}, start, end)
+	if err != nil {
+		t.Fatalf("buildReport --exact-self-time: %v", err)
+	}
+	if !strings.Contains(exact.Markdown, "Self-time is exact") {
+		t.Errorf("exact report must note exact self-time")
+	}
+
 	if _, err := s.Services(ctx, start, end); err != nil {
 		t.Errorf("services: %v", err)
 	}

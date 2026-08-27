@@ -23,6 +23,10 @@ type Store struct {
 	conn    driver.Conn
 	table   string
 	timeout time.Duration
+	// exactSelf switches the children CTE from summing child durations (fast,
+	// slightly under-counts self time when children overlap) to merging child
+	// intervals into their union (exact, heavier). Set per run by buildReport.
+	exactSelf bool
 }
 
 // identRe guards the two identifiers that cannot be passed as bound query
@@ -218,13 +222,28 @@ type Match struct {
 // counted regardless of whether the child itself matches, or self time would be
 // overstated.
 func (s *Store) childrenCTE() string {
+	childDur := "sum(Duration) AS child_dur"
+	if s.exactSelf {
+		// Union of each parent's child intervals, not the sum of their
+		// durations. arrayFold sweeps the intervals sorted by start, carrying
+		// (curEnd, covered) and adding only the part of each interval beyond
+		// curEnd — so overlapping children are counted once. This is the exact
+		// child coverage; subtracting it gives self time with no under-count.
+		childDur = `arrayFold(
+      (acc, iv) -> (greatest(acc.1, iv.2), acc.2 + greatest(toInt64(0), iv.2 - greatest(iv.1, acc.1))),
+      arraySort(x -> x.1, groupArray((
+        toInt64(toUnixTimestamp64Nano(Timestamp)),
+        toInt64(toUnixTimestamp64Nano(Timestamp)) + toInt64(Duration)))),
+      (toInt64(0), toInt64(0))
+    ).2 AS child_dur`
+	}
 	return fmt.Sprintf(`WITH children AS (
-  SELECT TraceId, ParentSpanId AS SpanId, sum(Duration) AS child_dur
+  SELECT TraceId, ParentSpanId AS SpanId, %s
   FROM %s
   WHERE Timestamp >= {start:DateTime64(9)} AND Timestamp < {end:DateTime64(9)}
     AND ParentSpanId != '' AND ParentSpanId != '0000000000000000'
   GROUP BY TraceId, ParentSpanId
-)`, s.table)
+)`, childDur, s.table)
 }
 
 // selfExpr is self time in nanoseconds: a span's own duration minus the time

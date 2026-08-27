@@ -19,16 +19,17 @@ type Report struct {
 
 // options carries the resolved CLI configuration into report building.
 type options struct {
-	dsn     string
-	table   string
-	from    string
-	to      string
-	by      string
-	match   []string
-	top     int
-	logs    bool
-	out     string
-	timeout time.Duration
+	dsn       string
+	table     string
+	from      string
+	to        string
+	by        string
+	match     []string
+	top       int
+	logs      bool
+	exactSelf bool
+	out       string
+	timeout   time.Duration
 }
 
 // buildReport runs the queries and renders the Markdown. It is deliberately
@@ -48,6 +49,7 @@ func buildReport(ctx context.Context, s *Store, o options, start, end time.Time)
 	if err != nil {
 		return Report{}, err
 	}
+	s.exactSelf = o.exactSelf
 
 	totals, err := s.GetTotals(ctx, start, end, matches)
 	if err != nil {
@@ -253,7 +255,11 @@ func renderReport(w io.Writer, o options, col Column, start, end time.Time,
 	}
 
 	fmt.Fprintf(w, "---\n")
-	fmt.Fprintf(w, "_Self-time is a span's own duration minus its children's, floored at zero; overlapping child spans make it approximate. Cumulative time (a parent plus its children) is intentionally not the ranking key because nested spans double-count it._\n")
+	if o.exactSelf {
+		fmt.Fprintf(w, "_Self-time is exact: each parent's child coverage is the **union** of its child spans' intervals (`--exact-self-time`), so concurrent children are counted once. Cumulative time (a parent plus its children) is intentionally not the ranking key because nested spans double-count it._\n")
+	} else {
+		fmt.Fprintf(w, "_Self-time is a span's own duration minus its children's, floored at zero; overlapping child spans make it approximate (pass `--exact-self-time` for the interval-union version). Cumulative time (a parent plus its children) is intentionally not the ranking key because nested spans double-count it._\n")
+	}
 }
 
 // orEmpty makes an empty string visible in a table so a blank service name

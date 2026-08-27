@@ -74,7 +74,13 @@ Children can overlap each other, or a child recorded on a different host can
 carry enough clock skew to run "longer" than its parent; the tool floors each
 span's self-time at zero so neither corrupts the sum, but a deeply concurrent
 service will have its self-time slightly understated. Judge the ranking, not the
-third decimal.
+third decimal — or pass `--exact-self-time`.
+
+`--exact-self-time` replaces the "minus the *sum* of child durations" step with
+"minus the *union* of child intervals", computed in ClickHouse with `arrayFold`
+over each parent's sorted child spans. Overlapping children are then counted
+once, so the number is exact rather than a slight under-count. It is a heavier
+query (a `groupArray` + fold per parent), which is why it is opt-in.
 
 ## Honest about empty and partial results
 
@@ -127,6 +133,7 @@ otelhousereport tables [flags]       list the otel_* tables present
 | `--match` | | filter to a value; **repeatable** (values AND together), e.g. `service=agentloop`, `span:http.request.method=POST` |
 | `--top` | `15` | rows in the operation and error tables (`0` = summary only: header + breakdown) |
 | `--logs` | `false` | add an **Error logs** section: recurring `otel_logs` lines correlated to error spans (highest severity first) |
+| `--exact-self-time` | `false` | self-time from the **union** of child intervals (exact, slower) instead of summed child durations |
 | `--out` | | write to this file instead of stdout |
 | `--timeout` | `25s` | per-query timeout (see the note below) |
 
