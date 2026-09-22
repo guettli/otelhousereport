@@ -205,7 +205,7 @@ func TestRenderReport(t *testing.T) {
 	errOps := []ErrRow{{Service: "agentloop", Op: "POST /q", Calls: 200, Errors: 3}}
 
 	var b strings.Builder
-	renderReport(&b, options{table: "otel_traces", top: 15}, col, start, end, totals, groups, ops, errOps, nil, nil)
+	renderReport(&b, options{table: "otel_traces", top: 15}, col, start, end, totals, groups, ops, errOps, nil, nil, 0)
 	out := b.String()
 
 	// grand self = 200e9 ns = 200 s over a 100 s window => 2.000 in flight.
@@ -236,7 +236,7 @@ func TestRenderReportMarksIncomplete(t *testing.T) {
 	col, _ := resolveColumn("service")
 	var b strings.Builder
 	renderReport(&b, options{table: "otel_traces", top: 15}, col, start, end,
-		Totals{Spans: 10}, nil, nil, nil, nil, []string{"hot operations: context deadline exceeded"})
+		Totals{Spans: 10}, nil, nil, nil, nil, []string{"hot operations: context deadline exceeded"}, 0)
 	out := b.String()
 	if !strings.Contains(out, "INCOMPLETE") || !strings.Contains(out, "deadline exceeded") {
 		t.Errorf("incomplete report must name the failure:\n%s", out)
@@ -250,7 +250,7 @@ func TestRenderReportEscapesPipesInNames(t *testing.T) {
 	ops := []OpRow{{Service: "svc", Op: "a|b", Calls: 1}}
 	var b strings.Builder
 	renderReport(&b, options{table: "otel_traces", top: 15}, col, start, end,
-		Totals{Spans: 1}, []GroupRow{{Name: "svc", Calls: 1, SelfNs: 1}}, ops, nil, nil, nil)
+		Totals{Spans: 1}, []GroupRow{{Name: "svc", Calls: 1, SelfNs: 1}}, ops, nil, nil, nil, 0)
 	if strings.Contains(b.String(), "| a|b |") {
 		t.Error("an unescaped pipe in an operation name breaks the table")
 	}
@@ -266,14 +266,14 @@ func TestRenderReportMostlyInChildren(t *testing.T) {
 	groups := []GroupRow{{Name: "svc", Calls: 100, CumNs: 100e9, SelfNs: 1e9}}
 	var b strings.Builder
 	renderReport(&b, options{table: "otel_traces", top: 15}, col, start, end,
-		Totals{Spans: 100}, groups, nil, nil, nil, nil)
+		Totals{Spans: 100}, groups, nil, nil, nil, nil, 0)
 	if !strings.Contains(b.String(), "Mostly in children") {
 		t.Errorf("parent-heavy selection must warn:\n%s", b.String())
 	}
 	// A normal selection (self a healthy fraction of cumulative) must NOT warn.
 	var b2 strings.Builder
 	renderReport(&b2, options{table: "otel_traces", top: 15}, col, start, end,
-		Totals{Spans: 100}, []GroupRow{{Name: "svc", Calls: 100, CumNs: 100e9, SelfNs: 70e9}}, nil, nil, nil, nil)
+		Totals{Spans: 100}, []GroupRow{{Name: "svc", Calls: 100, CumNs: 100e9, SelfNs: 70e9}}, nil, nil, nil, nil, 0)
 	if strings.Contains(b2.String(), "Mostly in children") {
 		t.Errorf("a healthy self/cum ratio must not warn:\n%s", b2.String())
 	}
@@ -290,7 +290,7 @@ func TestRenderReportErrorLogs(t *testing.T) {
 
 	var on strings.Builder
 	renderReport(&on, options{table: "otel_traces", top: 15, logs: true}, col, start, end,
-		Totals{Spans: 10, Errors: 2}, groups, nil, nil, logs, nil)
+		Totals{Spans: 10, Errors: 2}, groups, nil, nil, logs, nil, 0)
 	if !strings.Contains(on.String(), "## Error logs") || !strings.Contains(on.String(), "delete branch failed") {
 		t.Errorf("--logs must render the correlated logs section:\n%s", on.String())
 	}
@@ -298,7 +298,7 @@ func TestRenderReportErrorLogs(t *testing.T) {
 	// Without --logs the section must not appear, even with errors present.
 	var off strings.Builder
 	renderReport(&off, options{table: "otel_traces", top: 15}, col, start, end,
-		Totals{Spans: 10, Errors: 2}, groups, nil, nil, logs, nil)
+		Totals{Spans: 10, Errors: 2}, groups, nil, nil, logs, nil, 0)
 	if strings.Contains(off.String(), "## Error logs") {
 		t.Errorf("Error logs section must be opt-in:\n%s", off.String())
 	}
@@ -312,7 +312,7 @@ func TestRenderReportTopZeroOmitsTables(t *testing.T) {
 	col, _ := resolveColumn("service")
 	var b strings.Builder
 	renderReport(&b, options{table: "otel_traces", top: 0}, col, start, end,
-		Totals{Spans: 10, Errors: 2}, []GroupRow{{Name: "svc", Calls: 10, Errors: 2, SelfNs: 1e9}}, nil, nil, nil, nil)
+		Totals{Spans: 10, Errors: 2}, []GroupRow{{Name: "svc", Calls: 10, Errors: 2, SelfNs: 1e9}}, nil, nil, nil, nil, 0)
 	out := b.String()
 	if strings.Contains(out, "## Hottest operations") || strings.Contains(out, "## Errors") {
 		t.Errorf("--top=0 must omit the top-N sections:\n%s", out)

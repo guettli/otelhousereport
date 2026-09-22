@@ -69,6 +69,18 @@ the time its child spans covered. Summed across a group, self-time adds up to
 real elapsed work with no double counting, which is why the `%TIME` column sums
 to 100.
 
+### High-cardinality breakdowns
+
+`--by` an id-like attribute (`span:http.url`, a request id) can have thousands
+of distinct values, and one Markdown row each is an unusable wall. The
+breakdown is capped at `--max-groups` (default 50) rows **by self-time**, and
+everything below the cap is summed into a single **(other)** row — so the table
+stays bounded but the totals stay complete and `%TIME` still sums to 100. A note
+says how many values were folded and how to raise the cap; `--max-groups=0`
+disables it. The remainder is measured, not dropped: filling the `(other)` row
+correctly costs one extra aggregate, and it runs *only* when the cap actually
+bites, so an ordinary low-cardinality report pays nothing.
+
 Self-time is an **approximation**, and the tool says so in its own footer.
 Children can overlap each other, or a child recorded on a different host can
 carry enough clock skew to run "longer" than its parent; the tool floors each
@@ -132,6 +144,7 @@ otelhousereport tables [flags]       list the otel_* tables present
 | `--by` | `service` | breakdown column: `service`, `name`, `kind`, `status`, or an attribute key `res:<key>` / `span:<key>` |
 | `--match` | | filter to a value; **repeatable** (values AND together), e.g. `service=agentloop`, `span:http.request.method=POST` |
 | `--top` | `15` | rows in the operation and error tables (`0` = summary only: header + breakdown) |
+| `--max-groups` | `50` | max rows in the breakdown table; the rest are summed into an **(other)** row (`0` = no cap) |
 | `--logs` | `false` | add an **Error logs** section: recurring `otel_logs` lines correlated to error spans (highest severity first) |
 | `--exact-self-time` | `false` | self-time from the **union** of child intervals (exact, slower) instead of summed child durations |
 | `--out` | | write to this file instead of stdout |

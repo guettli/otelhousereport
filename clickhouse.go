@@ -276,17 +276,28 @@ FROM %s s WHERE %s`, s.table, where)
 	return t, nil
 }
 
-func (s *Store) GroupBy(ctx context.Context, col Column, start, end time.Time, matches []Match) ([]GroupRow, error) {
+// GroupBy breaks the window down by one column, ordered by self-time. limit
+// caps the rows returned (0 = no cap): the caller passes maxGroups+1 so it can
+// tell a full page from a truncated one and fold the tail into an "(other)"
+// row, because a high-cardinality --by (an id-like attribute) would otherwise
+// return one row per distinct value -- thousands of them -- as an unusable wall
+// of Markdown. The LIMIT bounds the rows transferred and rendered; the tail is
+// accounted for by GroupGrandTotals, not dropped.
+func (s *Store) GroupBy(ctx context.Context, col Column, start, end time.Time, matches []Match, limit int) ([]GroupRow, error) {
 	gexpr, gargs := col.exprAndArgs("bykey")
 	where, args := s.filter(start, end, matches)
 	args = append(args, gargs...)
+	limitClause := ""
+	if limit > 0 {
+		limitClause = fmt.Sprintf("LIMIT %d", limit)
+	}
 	q := fmt.Sprintf(`%s
 SELECT %s AS g, count() AS calls, countIf(s.StatusCode = 'Error') AS errors,
        toFloat64(sum(s.Duration)) AS cum_ns, toFloat64(%s) AS self_ns
 FROM %s s %s
 WHERE %s
-GROUP BY g ORDER BY self_ns DESC %s`,
-		s.childrenCTE(), gexpr, selfExpr, s.table, joinChildren, where, settings)
+GROUP BY g ORDER BY self_ns DESC %s %s`,
+		s.childrenCTE(), gexpr, selfExpr, s.table, joinChildren, where, limitClause, settings)
 	cctx, cancel := s.call(ctx)
 	defer cancel()
 	rows, err := s.conn.Query(cctx, q, args...)
@@ -303,6 +314,32 @@ GROUP BY g ORDER BY self_ns DESC %s`,
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// GroupGrandTotals returns, across ALL groups and ignoring any row cap, the
+// total self-time, the total cumulative time, and the number of distinct
+// groups. It is run only when the capped GroupBy came back full, to fill the
+// "(other)" row and say how many groups it folds -- so the common,
+// low-cardinality report never pays for it. Its numbers are the true
+// denominators: %TIME and the total row stay correct even though only the top
+// rows are shown.
+func (s *Store) GroupGrandTotals(ctx context.Context, col Column, start, end time.Time, matches []Match) (selfNs, cumNs float64, groups uint64, err error) {
+	gexpr, gargs := col.exprAndArgs("bykey")
+	where, args := s.filter(start, end, matches)
+	args = append(args, gargs...)
+	q := fmt.Sprintf(`%s
+SELECT toFloat64(sum(s.Duration)) AS cum_ns, toFloat64(%s) AS self_ns,
+       uniqExact(%s) AS groups
+FROM %s s %s
+WHERE %s %s`,
+		s.childrenCTE(), selfExpr, gexpr, s.table, joinChildren, where, settings)
+	cctx, cancel := s.call(ctx)
+	defer cancel()
+	row := s.conn.QueryRow(cctx, q, args...)
+	if err := row.Scan(&cumNs, &selfNs, &groups); err != nil {
+		return 0, 0, 0, fmt.Errorf("group totals: %w", translateCHError(err, s.timeout))
+	}
+	return selfNs, cumNs, groups, nil
 }
 
 func (s *Store) HotOps(ctx context.Context, start, end time.Time, top int, matches []Match) ([]OpRow, error) {
