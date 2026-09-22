@@ -53,6 +53,7 @@ func run(args []string) error {
 	fs.StringVar(&o.by, "by", "service", "breakdown column: service, name, kind, status, or res:<key> / span:<key>")
 	fs.Var((*stringSlice)(&o.match), "match", `filter to a value; repeatable, e.g. service=agentloop or span:http.request.method=POST`)
 	fs.IntVar(&o.top, "top", 15, "rows in the operation and error tables (0 = omit them; summary only)")
+	fs.IntVar(&o.maxGroups, "max-groups", 50, "max rows in the breakdown table; the rest are summed into (other) (0 = no cap)")
 	fs.BoolVar(&o.logs, "logs", false, "add an Error logs section: recurring log lines from otel_logs correlated to error spans")
 	fs.BoolVar(&o.exactSelf, "exact-self-time", false, "compute self-time from the union of child intervals (exact but slower); default subtracts summed child durations")
 	fs.StringVar(&o.out, "out", "", "write the report to this file (default: stdout)")
@@ -80,6 +81,9 @@ func run(args []string) error {
 	}
 	if o.top < 0 {
 		return fmt.Errorf("--top must be >= 0, got %d", o.top)
+	}
+	if o.maxGroups < 0 {
+		return fmt.Errorf("--max-groups must be >= 0 (0 = no cap), got %d", o.maxGroups)
 	}
 
 	start, end, err := parseWindow(o.from, o.to)

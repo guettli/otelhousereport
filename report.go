@@ -26,6 +26,7 @@ type options struct {
 	by        string
 	match     []string
 	top       int
+	maxGroups int
 	logs      bool
 	exactSelf bool
 	out       string
@@ -65,9 +66,37 @@ func buildReport(ctx context.Context, s *Store, o options, start, end time.Time)
 	var failures []string
 	note := func(err error) { failures = append(failures, err.Error()) }
 
-	groups, err := s.GroupBy(ctx, col, start, end, matches)
+	// Cap the breakdown. A high-cardinality --by (an id-like attribute) would
+	// otherwise return one row per distinct value. Fetch one more than the cap
+	// so a full page is distinguishable from a truncated one; the tail is
+	// folded into an honest "(other)" row below, never dropped.
+	limit := 0
+	if o.maxGroups > 0 {
+		limit = o.maxGroups + 1
+	}
+	groups, err := s.GroupBy(ctx, col, start, end, matches, limit)
 	if err != nil {
 		note(err)
+	}
+	// moreGroups > 0 means the breakdown was capped: some groups are summarised
+	// in the "(other)" row rather than listed. renderReport uses it for the note.
+	var moreGroups uint64
+	if o.maxGroups > 0 && len(groups) > o.maxGroups {
+		// The tail exists. Get the true grand totals (self, cum, group count)
+		// across ALL groups so the "(other)" row and %TIME stay exact, then
+		// trim to the cap and synthesise the remainder. This second query runs
+		// ONLY here, on the high-cardinality path -- the common report never
+		// pays for it.
+		grandSelf, grandCum, groupCount, gerr := s.GroupGrandTotals(ctx, col, start, end, matches)
+		if gerr != nil {
+			// Can't reconcile the remainder, so don't fake it: keep the top
+			// rows, drop the extra probe row, and note the run is incomplete
+			// rather than render an "(other)" with invented numbers.
+			note(gerr)
+			groups = groups[:o.maxGroups]
+		} else {
+			groups, moreGroups = foldRemainder(groups, grandSelf, grandCum, totals, groupCount, o.maxGroups)
+		}
 	}
 	// --top=0 asks for a summary: the header and the breakdown only. Skip the
 	// two top-N tables entirely rather than running LIMIT 0 queries and then
@@ -99,14 +128,14 @@ func buildReport(ctx context.Context, s *Store, o options, start, end time.Time)
 	}
 
 	var b strings.Builder
-	renderReport(&b, o, col, start, end, totals, groups, ops, errOps, logs, failures)
+	renderReport(&b, o, col, start, end, totals, groups, ops, errOps, logs, failures, moreGroups)
 	return Report{Markdown: b.String(), Incomplete: len(failures) > 0}, nil
 }
 
 // renderReport writes the Markdown. It is a pure function of already-fetched
 // data so it can be unit-tested without a database.
 func renderReport(w io.Writer, o options, col Column, start, end time.Time,
-	t Totals, groups []GroupRow, ops []OpRow, errOps []ErrRow, logs []LogRow, failures []string) {
+	t Totals, groups []GroupRow, ops []OpRow, errOps []ErrRow, logs []LogRow, failures []string, moreGroups uint64) {
 
 	windowSecs := end.Sub(start).Seconds()
 	var grandSelf, grandCum float64
@@ -150,6 +179,10 @@ func renderReport(w io.Writer, o options, col Column, start, end time.Time,
 	fmt.Fprintf(w, "## Where time goes — by %s\n\n", col.Flag)
 	if len(groups) > 0 {
 		fmt.Fprintf(w, "`INFLIGHT` is self-time ÷ wall-time — the average number of these spans running at once. `%%TIME` is the share of total self-time.\n\n")
+		if moreGroups > 0 {
+			fmt.Fprintf(w, "Showing the top %d by self-time; the remaining %s %s are summed into **(other)**, so the total is still complete. Raise `--max-groups` to list more.\n\n",
+				o.maxGroups, humanCount(moreGroups), plural(moreGroups, col.Flag+" value", col.Flag+" values"))
+		}
 		headers := []string{col.Header, "INFLIGHT", "%TIME", "CALLS", "ERRORS"}
 		var rows [][]string
 		for _, g := range groups {
@@ -367,4 +400,68 @@ func explainEmpty(ctx context.Context, s *Store, table string, start, end time.T
 	}
 	return fmt.Errorf("no spans in %s; %s holds %s spans from `%s` .. `%s` — widen --from/--to to cover that",
 		win, table, humanCount(n), mn.UTC().Format(time.RFC3339), mx.UTC().Format(time.RFC3339))
+}
+
+// foldRemainder trims a capped breakdown to its top rows and appends a single
+// "(other)" row for everything below the cap, so the table stays bounded while
+// the totals stay complete. Pure — the grand totals it needs are fetched by the
+// caller — so the fold math (and its %TIME-sums-to-100 property) is testable
+// without a database.
+//
+// grandSelf/grandCum are the true totals across ALL groups; t.Spans/t.Errors
+// the true span/error counts; groupCount the number of distinct groups. The
+// "(other)" row is the difference between those and the shown rows, floored so
+// two queries disagreeing at the window edge cannot make it negative.
+func foldRemainder(groups []GroupRow, grandSelf, grandCum float64, t Totals, groupCount uint64, maxGroups int) ([]GroupRow, uint64) {
+	if maxGroups <= 0 || len(groups) <= maxGroups {
+		return groups, 0
+	}
+	shown := groups[:maxGroups]
+	var sumSelf, sumCum float64
+	var sumCalls, sumErrors uint64
+	for _, g := range shown {
+		sumSelf += g.SelfNs
+		sumCum += g.CumNs
+		sumCalls += g.Calls
+		sumErrors += g.Errors
+	}
+	other := GroupRow{
+		Name:   "(other)",
+		Calls:  subU(t.Spans, sumCalls),
+		Errors: subU(t.Errors, sumErrors),
+		CumNs:  nonNeg(grandCum - sumCum),
+		SelfNs: nonNeg(grandSelf - sumSelf),
+	}
+	var more uint64
+	if groupCount > uint64(maxGroups) {
+		more = groupCount - uint64(maxGroups)
+	}
+	return append(shown, other), more
+}
+
+// subU subtracts without underflowing an unsigned total, in case an independent
+// totals query and the group sums disagree at the edges of the window.
+func subU(a, b uint64) uint64 {
+	if b > a {
+		return 0
+	}
+	return a - b
+}
+
+// nonNeg floors a float at zero: the grand totals and the shown-group sums come
+// from two queries over the same window and can differ by a hair, which must
+// not make "(other)" negative.
+func nonNeg(f float64) float64 {
+	if f < 0 {
+		return 0
+	}
+	return f
+}
+
+// plural picks the singular or plural noun for n.
+func plural(n uint64, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
