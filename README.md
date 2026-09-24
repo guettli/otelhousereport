@@ -186,6 +186,27 @@ it goes digging in individual traces.
   user profile commonly constrains it to `<= 30s`. The default is `25s` for that
   reason; raise it only if the server allows a larger cap, or a wide-window query
   will be rejected outright rather than merely slow.
+- **Slow, or timing out, on a multi-tenant ClickHouse? Add `?enable_analyzer=0`
+  to the DSN.** When you read through a per-tenant read-only user whose rows are
+  scoped by a **row policy** — the usual multi-tenant setup — you can hit
+  ClickHouse bug [#82369](https://github.com/ClickHouse/ClickHouse/issues/82369):
+  with the *new* analyzer (the default since 24.x), a row policy makes the planner
+  **ignore the `otel_*` skip indexes and partition pruning**, so even a narrow
+  query full-scans the table. It runs for tens of seconds, trips `--timeout`, and
+  on a memory-tight server one such query can wedge (and OOM-restart) ClickHouse
+  for *every* tenant. Pinning the **old** analyzer restores index + partition
+  pruning — verified on 25.8: a trace-id lookup dropped from a 30 s timeout to
+  ~20 ms, same rows, isolation intact:
+
+  ```sh
+  export CLICKHOUSE_DSN='clickhouse://ro:***@ch:9000/otel?enable_analyzer=0'
+  ```
+
+  clickhouse-go forwards DSN query params as session settings. If you *operate*
+  the server, prefer setting it once on the tenant's profile —
+  `ALTER SETTINGS PROFILE tenant_ro SETTINGS enable_analyzer = 0` — so every
+  reader benefits without touching each DSN. Revisit when #82369 is fixed
+  upstream (the old analyzer is deprecated).
 - **Start narrow.** The self-time breakdown is a windowed self-join of the
   traces table; a wide window over a busy table is real work for the server.
 - **Read-only by design.** The tool issues no DDL, no writes, and never
